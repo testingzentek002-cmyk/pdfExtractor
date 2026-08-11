@@ -6,9 +6,10 @@
  *   Sheet 1 "Voter Data"   — main output, one row per voter, styled
  *   Sheet 2 "Raw Text"     — hidden reference sheet with raw box text
  *
- * Column order (locked — per BLAST spec):
- *   S.No | Voter ID | Name | Relation Type | Relation Name |
- *   House No | Age | Gender | Page No | Box No | Extraction Status
+ * Column order (locked):
+ *   S.No | Part No | Assembly Constituency | Section No & Name | Serial No |
+ *   EPIC ID | Voter Name | Relation Type | Relation Name | House No | Age |
+ *   Gender | Photo Status | Page No | Box No | Extraction Status
  */
 
 'use strict';
@@ -19,17 +20,22 @@ const logger  = require('./logger');
 // ─── Column definitions ───────────────────────────────────────────────────────
 
 const COLUMNS = [
-  { header: 'S.No',               key: 'sNo',              width: 8  },
-  { header: 'Voter ID',           key: 'voterId',          width: 16 },
-  { header: 'Name',               key: 'name',             width: 30 },
-  { header: 'Relation Type',      key: 'relationType',     width: 16 },
-  { header: 'Relation Name',      key: 'relationName',     width: 30 },
-  { header: 'House No',           key: 'houseNo',          width: 14 },
-  { header: 'Age',                key: 'age',              width: 8  },
-  { header: 'Gender',             key: 'gender',           width: 12 },
-  { header: 'Page No',            key: 'pageNo',           width: 10 },
-  { header: 'Box No',             key: 'boxNo',            width: 10 },
-  { header: 'Extraction Status',  key: 'extractionStatus', width: 20 },
+  { header: 'S.No',                   key: 'sNo',                  width: 8  },
+  { header: 'Part No',                key: 'partNo',               width: 10 },
+  { header: 'Assembly Constituency',  key: 'assemblyConstituency', width: 34 },
+  { header: 'Section No & Name',      key: 'sectionNoAndName',     width: 28 },
+  { header: 'Serial No',              key: 'serialNo',             width: 10 },
+  { header: 'EPIC ID',                key: 'epicId',               width: 16 },
+  { header: 'Voter Name',             key: 'voterName',            width: 30 },
+  { header: 'Relation Type',          key: 'relationType',         width: 14 },
+  { header: 'Relation Name',          key: 'relationName',         width: 30 },
+  { header: 'House No',               key: 'houseNo',              width: 14 },
+  { header: 'Age',                    key: 'age',                  width: 8  },
+  { header: 'Gender',                 key: 'gender',               width: 12 },
+  { header: 'Photo Status',           key: 'photoStatus',          width: 14 },
+  { header: 'Page No',                key: 'pageNo',               width: 10 },
+  { header: 'Box No',                 key: 'boxNo',                width: 10 },
+  { header: 'Extraction Status',      key: 'extractionStatus',     width: 20 },
 ];
 
 // ─── Colours & styles ─────────────────────────────────────────────────────────
@@ -104,7 +110,7 @@ function createTemplate() {
     { header: 'S.No',     key: 'sNo',     width: 8  },
     { header: 'Page No',  key: 'pageNo',  width: 10 },
     { header: 'Box No',   key: 'boxNo',   width: 10 },
-    { header: 'Voter ID', key: 'voterId', width: 16 },
+    { header: 'EPIC ID',  key: 'epicId',  width: 16 },
     { header: 'Raw Text', key: 'rawText', width: 80 },
   ];
 
@@ -129,17 +135,22 @@ function createTemplate() {
 function writeRow(worksheet, record, rowIndex, status) {
   const row = worksheet.getRow(rowIndex);
 
-  row.getCell('sNo').value            = rowIndex - 1;   // sequential S.No
-  row.getCell('voterId').value        = record.voterId      || '';
-  row.getCell('name').value           = record.name         || '';
-  row.getCell('relationType').value   = record.relationType || '';
-  row.getCell('relationName').value   = record.relationName || '';
-  row.getCell('houseNo').value        = record.houseNo      || '';
-  row.getCell('age').value            = record.age          ?? '';
-  row.getCell('gender').value         = record.gender       || '';
-  row.getCell('pageNo').value         = record.pageNo;
-  row.getCell('boxNo').value          = record.boxNo;
-  row.getCell('extractionStatus').value = status;
+  row.getCell('sNo').value                  = rowIndex - 1;   // sequential S.No
+  row.getCell('partNo').value               = record.part_no              ?? '';
+  row.getCell('assemblyConstituency').value = record.assembly_constituency || '';
+  row.getCell('sectionNoAndName').value     = record.section_no_and_name   || '';
+  row.getCell('serialNo').value             = record.serial_no            ?? '';
+  row.getCell('epicId').value               = record.epic_id              || '';
+  row.getCell('voterName').value            = record.voter_name           || '';
+  row.getCell('relationType').value         = record.relation_type        || '';
+  row.getCell('relationName').value         = record.relation_name        || '';
+  row.getCell('houseNo').value              = record.house_no             || '';
+  row.getCell('age').value                  = record.age                  ?? '';
+  row.getCell('gender').value               = record.gender               || '';
+  row.getCell('photoStatus').value          = record.photo_status         || '';
+  row.getCell('pageNo').value               = record.pageNo;
+  row.getCell('boxNo').value                = record.boxNo;
+  row.getCell('extractionStatus').value     = status;
 
   // Apply row colour by status
   const fill = status === 'NEEDS_REVIEW' ? ROW_FILL_NEEDS_REVIEW
@@ -173,7 +184,7 @@ function writeRawRow(rawSheet, record, rowIndex) {
   row.getCell('sNo').value     = rowIndex - 1;
   row.getCell('pageNo').value  = record.pageNo;
   row.getCell('boxNo').value   = record.boxNo;
-  row.getCell('voterId').value = record.voterId || '';
+  row.getCell('epicId').value  = record.epic_id || '';
   row.getCell('rawText').value = record.rawText || '';
   row.getCell('rawText').alignment = { wrapText: true, vertical: 'top' };
   row.commit();

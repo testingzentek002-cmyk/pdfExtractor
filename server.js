@@ -178,6 +178,7 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
     const extractor = useClaude ? require('./src/claudeExtractor') : require('./src/parser');
     const { validateBatchResult, classifyRecord } = require('./src/validator');
     const { batchArray, dedupKey } = require('./src/utils');
+    const { extractPageHeader } = require('./src/parser');
     const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '9', 10);
 
     const seen = new Map();
@@ -194,6 +195,10 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
       totalBoxes += boxes.length;
       emit({ type: 'boxes', message: `Page ${pageNum}: ${boxes.length} box(es) detected`, count: boxes.length });
 
+      // Page-level header fields — extracted once per page, repeated onto every row.
+      const pageText   = textItems.map(item => item.str).join('\n');
+      const pageHeader = extractPageHeader(pageText);
+
       const batches = batchArray(boxes, BATCH_SIZE);
 
       for (let bi = 0; bi < batches.length; bi++) {
@@ -202,24 +207,27 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
         try {
           records = await extractor.extractBatch(batch);
         } catch (err) {
-          records = batch.map(box => needsReviewStub(box));
+          records = batch.map(box => needsReviewStub(box, useClaude));
         }
 
         const { valid } = validateBatchResult(records, batch.length);
         if (!valid) {
           try { records = await extractor.extractBatch(batch); }
-          catch (_) { records = batch.map(box => needsReviewStub(box)); }
+          catch (_) { records = batch.map(box => needsReviewStub(box, useClaude)); }
         }
 
         for (let i = 0; i < records.length; i++) {
-          const rec    = records[i];
           const srcBox = batch[i];
+          const rec    = normalizeRecord(records[i], useClaude);
           rec.pageNo  = rec.pageNo  ?? srcBox.pageNo;
           rec.boxNo   = rec.boxNo   ?? srcBox.boxNo;
           rec.rawText = rec.rawText ?? srcBox.rawText;
+          rec.part_no               = pageHeader.partNo;
+          rec.assembly_constituency = pageHeader.assemblyConstituency;
+          rec.section_no_and_name   = pageHeader.sectionNoAndName;
 
           const status = classifyRecord(rec);
-          const key    = dedupKey(rec.voterId, rec.pageNo, rec.boxNo);
+          const key    = dedupKey(rec.epic_id, rec.pageNo, rec.boxNo);
           if (seen.has(key)) continue;
           seen.set(key, excelRow);
 
@@ -263,10 +271,36 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
   }
 }
 
-function needsReviewStub(box) {
+function needsReviewStub(box, useClaude) {
+  if (useClaude) {
+    return { serial_no: null, epic_id: null, voter_name: null, relation_type: null,
+      relation_name: null, house_no: null, age: null, gender: null, photo_status: null,
+      pageNo: box.pageNo, boxNo: box.boxNo, rawText: box.rawText };
+  }
   return { serialNo: null, voterId: null, name: null, relationType: null,
     relationName: null, houseNo: null, age: null, gender: null,
     confidence: 'low', pageNo: box.pageNo, boxNo: box.boxNo, rawText: box.rawText };
+}
+
+function normalizeRecord(rec, useClaude) {
+  if (useClaude) {
+    return {
+      part_no: null, assembly_constituency: null, section_no_and_name: null,
+      serial_no: rec.serial_no ?? null, epic_id: rec.epic_id ?? null,
+      voter_name: rec.voter_name ?? null, relation_type: rec.relation_type ?? null,
+      relation_name: rec.relation_name ?? null, house_no: rec.house_no ?? null,
+      age: rec.age ?? null, gender: rec.gender ?? null, photo_status: rec.photo_status ?? null,
+      pageNo: rec.pageNo, boxNo: rec.boxNo, rawText: rec.rawText,
+    };
+  }
+  return {
+    part_no: null, assembly_constituency: null, section_no_and_name: null,
+    serial_no: rec.serialNo ?? null, epic_id: rec.voterId ?? null,
+    voter_name: rec.name ?? null, relation_type: rec.relationType ?? null,
+    relation_name: rec.relationName ?? null, house_no: rec.houseNo ?? null,
+    age: rec.age ?? null, gender: rec.gender ?? null, photo_status: null,
+    pageNo: rec.pageNo, boxNo: rec.boxNo, rawText: rec.rawText,
+  };
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

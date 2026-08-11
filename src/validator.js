@@ -10,6 +10,7 @@
 
 const fs     = require('fs');
 const path   = require('path');
+const url    = require('url');
 const logger = require('./logger');
 
 // ─── Pre-flight checks ────────────────────────────────────────────────────────
@@ -43,15 +44,15 @@ async function validateDependencies(opts) {
     outDirOk ? outDir : `Cannot write to: ${outDir}`);
   if (!outDirOk) allPassed = false;
 
-  // 3. pdfjs-dist can be imported
+  // 3. pdfjs-dist can be imported (ESM-only since v4 — use dynamic import)
   let pdfLibOk = false;
   try {
-    require('pdfjs-dist/legacy/build/pdf.js');
+    await import('pdfjs-dist/legacy/build/pdf.mjs');
     pdfLibOk = true;
   } catch (e) {
     // fallback — try default entry
     try {
-      require('pdfjs-dist');
+      await import('pdfjs-dist');
       pdfLibOk = true;
     } catch (_) {
       pdfLibOk = false;
@@ -139,15 +140,12 @@ function validateBatchResult(result, expectedCount) {
  * @returns {'OK'|'PARTIAL'|'NEEDS_REVIEW'}
  */
 function classifyRecord(record) {
-  // If extractor flagged low confidence → always NEEDS_REVIEW
-  if (record.confidence === 'low') return 'NEEDS_REVIEW';
-
   // Required fields for a meaningful record
-  const required = ['voterId', 'name'];
+  const required = ['epic_id', 'voter_name'];
   const missing  = required.filter(f => !record[f]);
 
   // Optional but important fields
-  const important = ['age', 'gender', 'houseNo'];
+  const important = ['age', 'gender', 'house_no'];
   const partialMissing = important.filter(f => !record[f]);
 
   if (missing.length > 0)           return 'NEEDS_REVIEW';
@@ -180,12 +178,15 @@ function checkDirWritable(dirPath) {
 
 async function checkPdfHasText(pdfPath) {
   try {
-    let pdfjsLib;
+    let pdfjsLib, workerSrc;
     try {
-      pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+      pdfjsLib  = await import('pdfjs-dist/legacy/build/pdf.mjs');
+      workerSrc = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
     } catch (_) {
-      pdfjsLib = require('pdfjs-dist');
+      pdfjsLib  = await import('pdfjs-dist');
+      workerSrc = require.resolve('pdfjs-dist/build/pdf.worker.mjs');
     }
+    pdfjsLib.GlobalWorkerOptions.workerSrc = url.pathToFileURL(workerSrc).href;
 
     const data      = new Uint8Array(fs.readFileSync(pdfPath));
     const loadTask  = pdfjsLib.getDocument({ data, verbosity: 0 });

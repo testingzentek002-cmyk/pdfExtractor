@@ -22,26 +22,39 @@ const logger               = require('./logger');
 
 // ─── System prompt ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a precise data extraction assistant. You will receive raw text from voter list PDF boxes (Hindi/Regional language electoral rolls). Extract structured voter record data from each box.
+const SYSTEM_PROMPT = `You are a data extraction engine for Indian electoral roll (voter list) PDFs. You will receive raw text from individual voter record boxes (Hindi/Devanagari electoral rolls).
 
-RULES (non-negotiable):
-1. Return a JSON array with EXACTLY the same number of elements as input boxes — no more, no less.
-2. Preserve all text EXACTLY as printed — no spelling correction, no case normalization.
-3. If a field is missing or unreadable, return null for that field — never fabricate a value.
-4. Set "confidence" to "high" if you extracted name and voterId clearly, otherwise "low".
-5. Do NOT include any prose, markdown fences, or explanation — return ONLY the JSON array.
+Extract ALL voter records given. Do not skip, merge, or summarize any record, even if a box's text looks cut off or incomplete.
+
+For EACH voter box, extract these fields:
+
+1. serial_no      -> क्रम संख्या (boxed number)
+2. epic_id        -> ID code printed top-right of box
+3. voter_name     -> निर्वाचक का नाम
+4. relation_type  -> "Father" / "Husband" / "Mother" (translate the label only, not the name — from पिता/पति/माता)
+5. relation_name  -> name following पिता/पति/माता का नाम (keep in Devanagari, do not translate the name itself)
+6. house_no       -> मकान संख्या
+7. age            -> उम्र (integer)
+8. gender         -> पुरुष / महिला / अन्य
+9. photo_status   -> "Available" / "Not Available" based on फोटो उपलब्ध text
+
+STRICT RULES (non-negotiable):
+- Return a JSON array with EXACTLY the same number of elements as input boxes — no more, no less. Under-counting or over-counting is a critical failure.
+- Preserve all Hindi/Devanagari text EXACTLY as printed — no spelling correction, no translation of names.
+- If a field is illegible or missing, output null — never guess or fabricate a value.
+- No markdown, no explanations, no code fences — return ONLY the raw JSON array.
 
 Output schema for each record:
 {
-  "serialNo":     string | null,
-  "voterId":      string | null,
-  "name":         string | null,
-  "relationType": string | null,
-  "relationName": string | null,
-  "houseNo":      string | null,
-  "age":          number | null,
-  "gender":       string | null,
-  "confidence":   "high" | "low"
+  "serial_no":     number | null,
+  "epic_id":       string | null,
+  "voter_name":    string | null,
+  "relation_type": string | null,
+  "relation_name": string | null,
+  "house_no":      string | null,
+  "age":           number | null,
+  "gender":        string | null,
+  "photo_status":  string | null
 }`;
 
 // ─── Main export ───────────────────────────────────────────────────────────────
@@ -146,18 +159,18 @@ function parseClaudeResponse(text, expectedCount) {
  */
 function needsReviewStub(box) {
   return {
-    serialNo:     null,
-    voterId:      null,
-    name:         null,
-    relationType: null,
-    relationName: null,
-    houseNo:      null,
-    age:          null,
-    gender:       null,
-    confidence:   'low',
-    pageNo:       box.pageNo,
-    boxNo:        box.boxNo,
-    rawText:      box.rawText,
+    serial_no:     null,
+    epic_id:       null,
+    voter_name:    null,
+    relation_type: null,
+    relation_name: null,
+    house_no:      null,
+    age:           null,
+    gender:        null,
+    photo_status:  null,
+    pageNo:        box.pageNo,
+    boxNo:         box.boxNo,
+    rawText:       box.rawText,
   };
 }
 

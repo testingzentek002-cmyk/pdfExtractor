@@ -21,6 +21,7 @@ const { loadPdf, readPdfPage, detectBoxes } = require('./pdfReader');
 const { validateBatchResult, classifyRecord }  = require('./validator');
 const { createTemplate, writeRow, writeRawRow, saveWorkbook } = require('./excelWriter');
 const { batchArray, dedupKey } = require('./utils');
+const { extractPageHeader } = require('./parser');
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '9', 10);
 
@@ -86,6 +87,11 @@ async function run(opts) {
       continue;
     }
 
+    // Page-level header fields (Part No, Assembly Constituency, Section No & Name)
+    // — extracted once per page and repeated onto every row from this page.
+    const pageText   = textItems.map(item => item.str).join('\n');
+    const pageHeader = extractPageHeader(pageText);
+
     // Batch boxes (never cross page boundary — each page's boxes are batched independently)
     const batches = batchArray(boxes, BATCH_SIZE);
 
@@ -100,7 +106,7 @@ async function run(opts) {
       } catch (err) {
         logger.error(`  Extractor error on batch ${batchIdx + 1}: ${err.message}`);
         // Fall back: mark all boxes in this batch as NEEDS_REVIEW
-        records = batch.map(box => needsReviewStub(box));
+        records = batch.map(box => needsReviewStub(box, useClaude));
       }
 
       // ── Validate batch length ─────────────────────────────────────────────
@@ -114,28 +120,32 @@ async function run(opts) {
           const retry = validateBatchResult(records, batch.length);
           if (!retry.valid) {
             logger.warn(`  Retry also failed (${retry.reason}). Flagging all ${batch.length} boxes as NEEDS_REVIEW.`);
-            records = batch.map(box => needsReviewStub(box));
+            records = batch.map(box => needsReviewStub(box, useClaude));
           }
         } catch (_) {
-          records = batch.map(box => needsReviewStub(box));
+          records = batch.map(box => needsReviewStub(box, useClaude));
         }
       }
 
       // ── Write records ─────────────────────────────────────────────────────
       for (let i = 0; i < records.length; i++) {
-        const rec    = records[i];
         const srcBox = batch[i];
 
-        // Ensure traceability is always set (parser should set these, but guard anyway)
+        // Normalize whichever engine's schema into the unified record shape,
+        // then stamp page-level header fields onto every row.
+        const rec = normalizeRecord(records[i], useClaude);
         rec.pageNo  = rec.pageNo  ?? srcBox.pageNo;
         rec.boxNo   = rec.boxNo   ?? srcBox.boxNo;
         rec.rawText = rec.rawText ?? srcBox.rawText;
+        rec.part_no               = pageHeader.partNo;
+        rec.assembly_constituency = pageHeader.assemblyConstituency;
+        rec.section_no_and_name   = pageHeader.sectionNoAndName;
 
         // Classify extraction quality
         const status = classifyRecord(rec);
 
         // Idempotency: check for duplicates
-        const key = dedupKey(rec.voterId, rec.pageNo, rec.boxNo);
+        const key = dedupKey(rec.epic_id, rec.pageNo, rec.boxNo);
         if (seen.has(key)) {
           logger.warn(`  Duplicate detected (key: ${key}) — skipping row`);
           duplicates++;
@@ -156,11 +166,10 @@ async function run(opts) {
         written++;
 
         logger.logAudit({
-          pageNo:     rec.pageNo,
-          boxNo:      rec.boxNo,
+          pageNo: rec.pageNo,
+          boxNo:  rec.boxNo,
           status,
-          confidence: rec.confidence,
-          notes:      rec.voterId ? `EPIC: ${rec.voterId}` : 'No Voter ID found',
+          notes:  rec.epic_id ? `EPIC: ${rec.epic_id}` : 'No Voter ID found',
         });
 
         excelRow++;
@@ -181,9 +190,30 @@ async function run(opts) {
   return { totalBoxes, written, flagged, partial, duplicates };
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────────────────────────
 
-function needsReviewStub(box) {
+/**
+ * Fallback stub for a box the extractor could not process at all, in whichever
+ * schema the active engine would have returned (so normalizeRecord() can
+ * handle it uniformly alongside real extraction results).
+ */
+function needsReviewStub(box, useClaude) {
+  if (useClaude) {
+    return {
+      serial_no:     null,
+      epic_id:       null,
+      voter_name:    null,
+      relation_type: null,
+      relation_name: null,
+      house_no:      null,
+      age:           null,
+      gender:        null,
+      photo_status:  null,
+      pageNo:        box.pageNo,
+      boxNo:         box.boxNo,
+      rawText:       box.rawText,
+    };
+  }
   return {
     serialNo:     null,
     voterId:      null,
@@ -197,6 +227,50 @@ function needsReviewStub(box) {
     pageNo:       box.pageNo,
     boxNo:        box.boxNo,
     rawText:      box.rawText,
+  };
+}
+
+/**
+ * Normalize a record from either engine's native schema into the unified
+ * schema used downstream (validator.classifyRecord, excelWriter columns).
+ * Page-level header fields are stamped on separately by the caller.
+ */
+function normalizeRecord(rec, useClaude) {
+  if (useClaude) {
+    return {
+      part_no:               null,
+      assembly_constituency: null,
+      section_no_and_name:   null,
+      serial_no:             rec.serial_no     ?? null,
+      epic_id:               rec.epic_id       ?? null,
+      voter_name:            rec.voter_name    ?? null,
+      relation_type:         rec.relation_type ?? null,
+      relation_name:         rec.relation_name ?? null,
+      house_no:              rec.house_no      ?? null,
+      age:                   rec.age           ?? null,
+      gender:                rec.gender        ?? null,
+      photo_status:          rec.photo_status  ?? null,
+      pageNo:                rec.pageNo,
+      boxNo:                 rec.boxNo,
+      rawText:               rec.rawText,
+    };
+  }
+  return {
+    part_no:               null,
+    assembly_constituency: null,
+    section_no_and_name:   null,
+    serial_no:             rec.serialNo     ?? null,
+    epic_id:               rec.voterId      ?? null,
+    voter_name:            rec.name         ?? null,
+    relation_type:         rec.relationType ?? null,
+    relation_name:         rec.relationName ?? null,
+    house_no:              rec.houseNo      ?? null,
+    age:                   rec.age          ?? null,
+    gender:                rec.gender       ?? null,
+    photo_status:          null,
+    pageNo:                rec.pageNo,
+    boxNo:                 rec.boxNo,
+    rawText:               rec.rawText,
   };
 }
 

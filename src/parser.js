@@ -97,6 +97,46 @@ function normaliseGender(raw) {
   return GENDER_MAP[key] || raw.trim();
 }
 
+// ─── Page-level header patterns ────────────────────────────────────────────────
+// These fields appear once per page (above the voter-box grid) and are repeated
+// onto every row extracted from that page, regardless of which engine (rule-based
+// or Claude) extracted the boxes themselves.
+
+const HEADER_PATTERNS = {
+  partNo: [
+    /भाग\s*(?:संख्या|सं\.?|क्रमांक)\s*[:\-]?\s*(\d+)/u,
+  ],
+  assemblyConstituency: [
+    /विधानसभा\s*निर्वाचन\s*क्षेत्र[^:\n]{0,30}[:\-]\s*(.+?)(?:\n|$)/u,
+    /विधानसभा\s*निर्वाचन\s*क्षेत्र\s*(.+?)(?:\n|$)/u,
+  ],
+  sectionNoAndName: [
+    /अनुभाग\s*(?:संख्या|सं\.?)\s*(?:एवं|और)?\s*नाम\s*[:\-]?\s*(.+?)(?:\n|$)/u,
+  ],
+};
+
+/**
+ * Extract page-level header fields (Part No, Assembly Constituency, Section
+ * No & Name) from a page's full raw text. Independent of the box-extraction
+ * engine — always run via regex, then stamped onto every row from that page.
+ *
+ * @param {string} pageText  Full raw text of one PDF page
+ * @returns {{ partNo: number|null, assemblyConstituency: string|null, sectionNoAndName: string|null }}
+ */
+function extractPageHeader(pageText) {
+  const text = cleanText(pageText);
+
+  const partNoRaw    = matchFirst(text, HEADER_PATTERNS.partNo);
+  const assemblyRaw  = matchFirst(text, HEADER_PATTERNS.assemblyConstituency);
+  const sectionRaw   = matchFirst(text, HEADER_PATTERNS.sectionNoAndName);
+
+  return {
+    partNo:               partNoRaw   ? safeParseInt(partNoRaw)  : null,
+    assemblyConstituency: assemblyRaw ? assemblyRaw.trim()       : null,
+    sectionNoAndName:     sectionRaw  ? sectionRaw.trim()        : null,
+  };
+}
+
 // ─── Core extraction ──────────────────────────────────────────────────────────
 
 /**
@@ -170,4 +210,5 @@ function matchFirst(text, patterns) {
 module.exports = {
   extractRecord,
   extractBatch,
+  extractPageHeader,
 };

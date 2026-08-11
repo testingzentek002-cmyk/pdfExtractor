@@ -11,22 +11,28 @@
 
 const fs     = require('fs');
 const path   = require('path');
+const url    = require('url');
 const logger = require('./logger');
 const { cleanText } = require('./utils');
 
 // ─── PDF library init ─────────────────────────────────────────────────────────
 
-function getPdfjsLib() {
+async function getPdfjsLib() {
+  // pdfjs-dist ships ESM-only from v4+ (no CommonJS build), so it must be
+  // loaded via dynamic import() even from this CommonJS module.
+  let lib, workerSrc;
   try {
-    const lib = require('pdfjs-dist/legacy/build/pdf.js');
-    // Disable worker in Node.js environment
-    lib.GlobalWorkerOptions.workerSrc = '';
-    return lib;
+    lib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    workerSrc = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
   } catch (_) {
-    const lib = require('pdfjs-dist');
-    lib.GlobalWorkerOptions.workerSrc = '';
-    return lib;
+    lib = await import('pdfjs-dist');
+    workerSrc = require.resolve('pdfjs-dist/build/pdf.worker.mjs');
   }
+  // Node has no DOM Worker; point at the real worker file so pdfjs's
+  // fake-worker fallback can load it instead of failing on an empty src.
+  // Node's ESM loader requires a file:// URL for absolute Windows paths.
+  lib.GlobalWorkerOptions.workerSrc = url.pathToFileURL(workerSrc).href;
+  return lib;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -37,7 +43,7 @@ function getPdfjsLib() {
  * @returns {Promise<Object>}  pdfjs document object
  */
 async function loadPdf(filePath) {
-  const pdfjsLib = getPdfjsLib();
+  const pdfjsLib = await getPdfjsLib();
   const data     = new Uint8Array(fs.readFileSync(filePath));
   const doc      = await pdfjsLib.getDocument({ data, verbosity: 0 }).promise;
   logger.info(`PDF loaded: ${path.basename(filePath)} — ${doc.numPages} page(s)`);
