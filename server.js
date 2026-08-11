@@ -20,6 +20,14 @@ const path     = require('path');
 const fs       = require('fs');
 const os       = require('os');
 const { EventEmitter } = require('events');
+const { handleUpload } = require('@vercel/blob/client');
+const { del } = require('@vercel/blob');
+
+// Vercel's serverless functions reject request bodies over 4.5 MB before our
+// code ever runs. When a Blob store is attached (BLOB_READ_WRITE_TOKEN set),
+// the browser uploads the PDF directly to Blob storage instead, bypassing
+// that limit — the server only ever receives the resulting blob URL.
+const useBlobUploads = !!process.env.BLOB_READ_WRITE_TOKEN;
 
 // ─── Patch logger to emit events for the web UI ──────────────────────────────
 // We override the singleton logger to broadcast via SSE
@@ -66,15 +74,67 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ─── GET /api/upload-mode ──────────────────────────────────────────────────────
+// Tells the client whether to upload the PDF directly to Vercel Blob (bypassing
+// the platform's 4.5 MB serverless request-body limit) or straight to /upload.
+app.get('/api/upload-mode', (req, res) => {
+  res.json({ mode: useBlobUploads ? 'blob' : 'direct' });
+});
+
+// ─── POST /api/blob-upload ──────────────────────────────────────────────────────
+// Authorizes the browser's direct-to-Blob upload (only reached when a Blob
+// store is configured). The file itself never passes through this function.
+app.post('/api/blob-upload', async (req, res) => {
+  try {
+    const jsonResponse = await handleUpload({
+      body: req.body,
+      request: req,
+      onBeforeGenerateToken: async (pathname, clientPayload) => ({
+        allowedContentTypes: ['application/pdf'],
+        addRandomSuffix: true,
+        maximumSizeInBytes: 100 * 1024 * 1024,
+      }),
+      onUploadCompleted: async () => {},
+    });
+    res.json(jsonResponse);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // ─── POST /upload ─────────────────────────────────────────────────────────────
-app.post('/upload', upload.single('pdf'), async (req, res) => {
-  if (!req.file) {
+app.post('/upload', (req, res, next) => {
+  // JSON body → the file already landed in Blob storage; skip multer entirely.
+  if (req.is('application/json')) return next();
+  upload.single('pdf')(req, res, next);
+}, async (req, res) => {
+  let inputPdf, originalName, blobUrl = null;
+
+  if (req.file) {
+    inputPdf     = req.file.path;
+    originalName = req.file.originalname;
+  } else if (req.body && req.body.blobUrl) {
+    blobUrl = req.body.blobUrl;
+    if (!/^https:\/\/[a-z0-9]+\.public\.blob\.vercel-storage\.com\//.test(blobUrl)) {
+      return res.status(400).json({ error: 'Invalid blob URL' });
+    }
+    originalName = req.body.filename || 'upload.pdf';
+    try {
+      const blobRes = await fetch(blobUrl);
+      if (!blobRes.ok) throw new Error(`fetch failed with status ${blobRes.status}`);
+      const buffer = Buffer.from(await blobRes.arrayBuffer());
+      const safe   = originalName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+      inputPdf     = path.join(uploadsDir, `${Date.now()}_${safe}`);
+      fs.writeFileSync(inputPdf, buffer);
+    } catch (err) {
+      return res.status(400).json({ error: `Could not retrieve uploaded file: ${err.message}` });
+    }
+  } else {
     return res.status(400).json({ error: 'No PDF file provided' });
   }
 
   const jobId      = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const inputPdf   = req.file.path;
-  const pdfBase    = path.basename(req.file.originalname, '.pdf').replace(/[^a-zA-Z0-9\-_]/g, '_');
+  const pdfBase    = path.basename(originalName, '.pdf').replace(/[^a-zA-Z0-9\-_]/g, '_');
   const outputExcel = path.join(outputDir, `${pdfBase}_${Date.now()}_extracted.xlsx`);
   const useClaude  = process.env.USE_CLAUDE === 'true';
 
@@ -83,7 +143,7 @@ app.post('/upload', upload.single('pdf'), async (req, res) => {
     status: 'queued',
     progress: [],
     outputPath: outputExcel,
-    inputName: req.file.originalname,
+    inputName: originalName,
     error: null,
     emitter,
     stats: null,
@@ -92,7 +152,7 @@ app.post('/upload', upload.single('pdf'), async (req, res) => {
   res.json({ jobId });
 
   // Run extraction asynchronously
-  setImmediate(() => runExtractionJob(jobId, inputPdf, outputExcel, useClaude));
+  setImmediate(() => runExtractionJob(jobId, inputPdf, outputExcel, useClaude, blobUrl));
 });
 
 // ─── GET /progress/:id  (Server-Sent Events) ──────────────────────────────────
@@ -145,7 +205,7 @@ app.get('/status/:id', (req, res) => {
 
 // ─── Extraction runner ────────────────────────────────────────────────────────
 
-async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
+async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude, blobUrl) {
   const job = jobs.get(jobId);
 
   function emit(msg) {
@@ -275,6 +335,9 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
     job.error  = err.message;
     emit({ type: 'error', message: err.message });
     emit({ type: 'close', status: 'error', error: err.message });
+  } finally {
+    fs.unlink(inputPdf, () => {});
+    if (blobUrl) del(blobUrl).catch(() => {});
   }
 }
 

@@ -438,6 +438,9 @@
   let selectedFile = null;
   let currentJobId = null;
   let evtSource    = null;
+  let uploadMode   = 'direct'; // 'direct' (multipart to /upload) or 'blob' (direct-to-storage, for large files on Vercel)
+
+  fetch('/api/upload-mode').then(r => r.json()).then(d => { uploadMode = d.mode; }).catch(() => {});
 
   // ── Elements ───────────────────────────────────────────────────────────────
   const dropZone     = document.getElementById('dropZone');
@@ -497,21 +500,36 @@
     downloadBtn.classList.remove('visible');
     resetLink.classList.remove('visible');
 
-    // Upload PDF
-    const form = new FormData();
-    form.append('pdf', selectedFile);
-
     addLog('info', `Uploading ${selectedFile.name}…`);
 
     let jobId;
     try {
-      const res  = await fetch('/upload', { method: 'POST', body: form });
+      let res;
+      if (uploadMode === 'blob') {
+        // Upload straight to Blob storage from the browser — skips our
+        // server entirely, so Vercel's 4.5 MB function body limit never applies.
+        const { upload } = await import('https://esm.sh/@vercel/blob@2.8.0/client');
+        const blob = await upload(selectedFile.name, selectedFile, {
+          access: 'public',
+          handleUploadUrl: '/api/blob-upload',
+        });
+        res = await fetch('/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ blobUrl: blob.url, filename: selectedFile.name }),
+        });
+      } else {
+        const form = new FormData();
+        form.append('pdf', selectedFile);
+        res = await fetch('/upload', { method: 'POST', body: form });
+      }
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       jobId = data.jobId;
       currentJobId = jobId;
     } catch (err) {
       addLog('err', `Upload failed: ${err.message}`);
+      extractBtn.disabled = false;
       return;
     }
 
