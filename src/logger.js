@@ -7,7 +7,11 @@
 'use strict';
 
 const fs   = require('fs');
+const os   = require('os');
 const path = require('path');
+
+// Vercel's serverless filesystem is read-only except for os.tmpdir().
+const LOGS_BASE_DIR = process.env.VERCEL ? os.tmpdir() : process.cwd();
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 
@@ -20,7 +24,7 @@ class Logger {
   }
 
   _ensureLogsDir() {
-    const logsDir = path.resolve(process.cwd(), 'logs');
+    const logsDir = path.resolve(LOGS_BASE_DIR, 'logs');
     if (!fs.existsSync(logsDir)) {
       fs.mkdirSync(logsDir, { recursive: true });
     }

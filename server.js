@@ -18,6 +18,7 @@ const express  = require('express');
 const multer   = require('multer');
 const path     = require('path');
 const fs       = require('fs');
+const os       = require('os');
 const { EventEmitter } = require('events');
 
 // ─── Patch logger to emit events for the web UI ──────────────────────────────
@@ -25,11 +26,17 @@ const { EventEmitter } = require('events');
 const baseLogger = require('./src/logger');
 
 // Global job registry
+// NOTE: on Vercel this Map only survives for the lifetime of one serverless
+// instance — a /progress or /download request may land on a different
+// instance than /upload and find no job. Fine for a single-instance/dev
+// deploy; not reliable for production traffic.
 const jobs = new Map(); // jobId → { status, progress, outputPath, error, emitter, stats }
 
 // ─── Multer config — store uploads in /uploads ────────────────────────────────
-const uploadsDir = path.join(__dirname, 'uploads');
-const outputDir  = path.join(__dirname, 'output');
+// Vercel's serverless filesystem is read-only except for os.tmpdir().
+const storageBaseDir = process.env.VERCEL ? os.tmpdir() : __dirname;
+const uploadsDir = path.join(storageBaseDir, 'uploads');
+const outputDir  = path.join(storageBaseDir, 'output');
 [uploadsDir, outputDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 const storage = multer.diskStorage({
@@ -304,10 +311,16 @@ function normalizeRecord(rec, useClaude) {
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log('\n╔══════════════════════════════════════════════════════════╗');
-  console.log('║      Voter PDF → Excel Extraction Agent  v1.0           ║');
-  console.log('║                   Web Server                             ║');
-  console.log('╚══════════════════════════════════════════════════════════╝');
-  console.log(`\n  🌐  Open in browser: http://localhost:${PORT}\n`);
-});
+// On Vercel, the platform imports `app` and invokes it per-request — it must
+// not call app.listen() itself.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log('\n╔══════════════════════════════════════════════════════════╗');
+    console.log('║      Voter PDF → Excel Extraction Agent  v1.0           ║');
+    console.log('║                   Web Server                             ║');
+    console.log('╚══════════════════════════════════════════════════════════╝');
+    console.log(`\n  🌐  Open in browser: http://localhost:${PORT}\n`);
+  });
+}
+
+module.exports = app;
