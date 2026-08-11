@@ -436,9 +436,7 @@
 <script>
   // ── State ──────────────────────────────────────────────────────────────────
   let selectedFile = null;
-  let currentJobId = null;
-  let evtSource    = null;
-  let uploadMode   = 'direct'; // 'direct' (multipart to /upload) or 'blob' (direct-to-storage, for large files on Vercel)
+  let uploadMode   = 'direct'; // 'direct' (multipart to /extract) or 'blob' (direct-to-storage, for large files on Vercel)
 
   fetch('/api/upload-mode').then(r => r.json()).then(d => { uploadMode = d.mode; }).catch(() => {});
 
@@ -502,7 +500,6 @@
 
     addLog('info', `Uploading ${selectedFile.name}…`);
 
-    let jobId;
     try {
       let res;
       if (uploadMode === 'blob') {
@@ -513,7 +510,7 @@
           access: 'public',
           handleUploadUrl: '/api/blob-upload',
         });
-        res = await fetch('/upload', {
+        res = await fetch('/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ blobUrl: blob.url, filename: selectedFile.name }),
@@ -521,27 +518,41 @@
       } else {
         const form = new FormData();
         form.append('pdf', selectedFile);
-        res = await fetch('/upload', { method: 'POST', body: form });
+        res = await fetch('/extract', { method: 'POST', body: form });
       }
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      jobId = data.jobId;
-      currentJobId = jobId;
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Request failed with status ${res.status}`);
+      }
+
+      addLog('ok', 'Upload complete. Processing…');
+
+      // The response streams newline-delimited JSON progress events, ending
+      // with a 'done' event carrying the download URL — all on this one
+      // connection, so there's nothing else to poll or reconnect to.
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (line) handleEvent(JSON.parse(line));
+        }
+      }
+      if (buf.trim()) handleEvent(JSON.parse(buf.trim()));
     } catch (err) {
-      addLog('err', `Upload failed: ${err.message}`);
+      addLog('err', `Extraction failed: ${err.message}`);
       extractBtn.disabled = false;
-      return;
+      resetLink.classList.add('visible');
     }
-
-    addLog('ok', `Upload complete. Job ID: ${jobId}`);
-
-    // Open SSE stream
-    evtSource = new EventSource(`/progress/${jobId}`);
-    evtSource.onmessage = e => handleEvent(JSON.parse(e.data), jobId);
-    evtSource.onerror   = () => { addLog('warn', 'SSE connection closed'); evtSource.close(); };
   });
 
-  function handleEvent(msg, jobId) {
+  function handleEvent(msg) {
     switch (msg.type) {
       case 'start':
         addLog('info', msg.message);
@@ -588,7 +599,7 @@
 
       case 'done':
         addLog('ok', `✔ ${msg.message}`);
-        showStats(msg.stats, jobId);
+        showStats(msg.stats, msg.downloadUrl);
         break;
 
       case 'error':
@@ -598,7 +609,6 @@
         break;
 
       case 'close':
-        evtSource.close();
         if (msg.status === 'done') {
           progressBar.style.width = '100%';
           progressPct.textContent = '100%';
@@ -617,7 +627,7 @@
     logBox.scrollTop = logBox.scrollHeight;
   }
 
-  function showStats(stats, jobId) {
+  function showStats(stats, downloadUrl) {
     statsGrid.style.display  = 'grid';
 
     document.getElementById('valBoxes').textContent   = stats.totalBoxes;
@@ -641,13 +651,11 @@
 
     // Download button
     downloadBtn.classList.add('visible');
-    downloadBtn.onclick = () => window.location.href = `/download/${jobId}`;
+    downloadBtn.onclick = () => window.location.href = downloadUrl;
   }
 
   function resetUI() {
     selectedFile = null;
-    currentJobId = null;
-    if (evtSource) { evtSource.close(); evtSource = null; }
 
     fileInput.value   = '';
     dropTitle.textContent = 'Drop your voter-list PDF here';

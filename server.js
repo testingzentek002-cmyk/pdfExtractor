@@ -4,10 +4,21 @@
  *
  * Endpoints:
  *   GET  /              → Serve the web UI
- *   POST /upload        → Accept PDF upload, start extraction, stream progress via SSE
- *   GET  /progress/:id  → SSE stream for real-time progress updates
- *   GET  /download/:id  → Download generated Excel file
- *   GET  /status/:id    → JSON status of a run
+ *   POST /extract       → Accept a PDF (multipart or a Blob URL), run extraction,
+ *                          and stream newline-delimited JSON progress events back
+ *                          on the same response, ending with a download URL.
+ *   GET  /download/:id  → Local-dev only: download the generated Excel file
+ *                          (used when no Blob store is configured).
+ *
+ * The whole upload → extract → result lifecycle happens inside a single HTTP
+ * request. Vercel serverless functions are stateless across invocations and
+ * may serve consecutive requests from different instances, so anything split
+ * across separate requests (e.g. an upload endpoint handing off a jobId to a
+ * separate /progress poll) can 404 when a later request lands on an instance
+ * that never saw the job. Keeping everything on one connection sidesteps that
+ * entirely — no cross-request state is needed to report progress. The final
+ * Excel file is likewise handed off via a Blob URL rather than a follow-up
+ * download request against local disk.
  */
 
 'use strict';
@@ -19,26 +30,23 @@ const multer   = require('multer');
 const path     = require('path');
 const fs       = require('fs');
 const os       = require('os');
-const { EventEmitter } = require('events');
 const { handleUpload } = require('@vercel/blob/client');
-const { del } = require('@vercel/blob');
+const { put, del } = require('@vercel/blob');
 
 // Vercel's serverless functions reject request bodies over 4.5 MB before our
 // code ever runs. When a Blob store is attached (BLOB_READ_WRITE_TOKEN set),
 // the browser uploads the PDF directly to Blob storage instead, bypassing
-// that limit — the server only ever receives the resulting blob URL.
+// that limit — the server only ever receives the resulting blob URL. The
+// finished Excel file is likewise returned via Blob so /download never needs
+// to be reachable from a different serverless instance.
 const useBlobUploads = !!process.env.BLOB_READ_WRITE_TOKEN;
 
 // ─── Patch logger to emit events for the web UI ──────────────────────────────
-// We override the singleton logger to broadcast via SSE
 const baseLogger = require('./src/logger');
 
-// Global job registry
-// NOTE: on Vercel this Map only survives for the lifetime of one serverless
-// instance — a /progress or /download request may land on a different
-// instance than /upload and find no job. Fine for a single-instance/dev
-// deploy; not reliable for production traffic.
-const jobs = new Map(); // jobId → { status, progress, outputPath, error, emitter, stats }
+// Local-dev-only download registry (single process, so no cross-instance risk).
+// Only used when useBlobUploads is false.
+const localDownloads = new Map(); // token → absolute file path
 
 // ─── Multer config — store uploads in /uploads ────────────────────────────────
 // Vercel's serverless filesystem is read-only except for os.tmpdir().
@@ -76,7 +84,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── GET /api/upload-mode ──────────────────────────────────────────────────────
 // Tells the client whether to upload the PDF directly to Vercel Blob (bypassing
-// the platform's 4.5 MB serverless request-body limit) or straight to /upload.
+// the platform's 4.5 MB serverless request-body limit) or straight to /extract.
 app.get('/api/upload-mode', (req, res) => {
   res.json({ mode: useBlobUploads ? 'blob' : 'direct' });
 });
@@ -102,8 +110,8 @@ app.post('/api/blob-upload', async (req, res) => {
   }
 });
 
-// ─── POST /upload ─────────────────────────────────────────────────────────────
-app.post('/upload', (req, res, next) => {
+// ─── POST /extract ─────────────────────────────────────────────────────────────
+app.post('/extract', (req, res, next) => {
   // JSON body → the file already landed in Blob storage; skip multer entirely.
   if (req.is('application/json')) return next();
   upload.single('pdf')(req, res, next);
@@ -133,95 +141,44 @@ app.post('/upload', (req, res, next) => {
     return res.status(400).json({ error: 'No PDF file provided' });
   }
 
-  const jobId      = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const pdfBase    = path.basename(originalName, '.pdf').replace(/[^a-zA-Z0-9\-_]/g, '_');
-  const outputExcel = path.join(outputDir, `${pdfBase}_${Date.now()}_extracted.xlsx`);
-  const useClaude  = process.env.USE_CLAUDE === 'true';
+  const useClaude = process.env.USE_CLAUDE === 'true';
 
-  const emitter = new EventEmitter();
-  jobs.set(jobId, {
-    status: 'queued',
-    progress: [],
-    outputPath: outputExcel,
-    inputName: originalName,
-    error: null,
-    emitter,
-    stats: null,
-  });
-
-  res.json({ jobId });
-
-  // Run extraction asynchronously
-  setImmediate(() => runExtractionJob(jobId, inputPdf, outputExcel, useClaude, blobUrl));
-});
-
-// ─── GET /progress/:id  (Server-Sent Events) ──────────────────────────────────
-app.get('/progress/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-
-  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Content-Type', 'application/x-ndjson');
   res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
   res.flushHeaders();
 
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const emit = (msg) => { res.write(JSON.stringify(msg) + '\n'); };
 
-  // Replay buffered messages
-  job.progress.forEach(msg => send(msg));
+  await runExtraction({ inputPdf, originalName, useClaude, blobUrl, emit });
 
-  // If already done, close immediately
-  if (job.status === 'done' || job.status === 'error') {
-    send({ type: 'close', status: job.status, stats: job.stats, error: job.error });
-    return res.end();
+  res.end();
+});
+
+// ─── GET /download/:token ───────────────────────────────────────────────────────
+// Local-dev fallback only (no Blob store configured). In Blob mode the client
+// downloads straight from the blob URL returned in the 'done' event.
+app.get('/download/:token', (req, res) => {
+  const filePath = localDownloads.get(req.params.token);
+  if (!filePath || !fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
   }
-
-  // Live messages
-  job.emitter.on('message', (msg) => {
-    send(msg);
-    if (msg.type === 'close') res.end();
-  });
-
-  req.on('close', () => job.emitter.removeAllListeners('message'));
-});
-
-// ─── GET /download/:id ────────────────────────────────────────────────────────
-app.get('/download/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  if (job.status !== 'done') return res.status(400).json({ error: 'Job not complete yet' });
-  if (!fs.existsSync(job.outputPath)) return res.status(404).json({ error: 'Output file not found' });
-
-  const filename = path.basename(job.outputPath);
-  res.download(job.outputPath, filename);
-});
-
-// ─── GET /status/:id ─────────────────────────────────────────────────────────
-app.get('/status/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json({ status: job.status, stats: job.stats, error: job.error, inputName: job.inputName });
+  res.download(filePath, path.basename(filePath));
 });
 
 // ─── Extraction runner ────────────────────────────────────────────────────────
 
-async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude, blobUrl) {
-  const job = jobs.get(jobId);
-
-  function emit(msg) {
-    job.progress.push(msg);
-    job.emitter.emit('message', msg);
-  }
-
+async function runExtraction({ inputPdf, originalName, useClaude, blobUrl, emit }) {
   try {
-    job.status = 'running';
-    emit({ type: 'start', message: `Starting extraction…`, inputName: job.inputName });
+    emit({ type: 'start', message: `Starting extraction…`, inputName: originalName });
+
+    const pdfBase     = path.basename(originalName, '.pdf').replace(/[^a-zA-Z0-9\-_]/g, '_');
+    const outputExcel = path.join(outputDir, `${pdfBase}_${Date.now()}_extracted.xlsx`);
 
     // ── Dependency validation ─────────────────────────────────────────────
     emit({ type: 'check', message: 'Running dependency checks…' });
 
     const { validateDependencies } = require('./src/validator');
-    // Temporarily redirect logger checkResult to SSE
+    // Temporarily redirect logger checkResult to the response stream
     const origCheck = baseLogger.checkResult.bind(baseLogger);
     baseLogger.checkResult = (label, passed, note) => {
       emit({ type: 'check_item', label, passed, note: note || '' });
@@ -321,18 +278,30 @@ async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude, blobUrl
       });
     }
 
-    await saveWorkbook(workbook, outputExcel);
-
     const stats = { totalBoxes, written, flagged, partial };
-    job.status  = 'done';
-    job.stats   = stats;
 
-    emit({ type: 'done', stats, message: `Done! ${written} records written. ${flagged} flagged for review.` });
+    // ── Deliver the output file ─────────────────────────────────────────────
+    let downloadUrl;
+    if (useBlobUploads) {
+      const buffer  = await workbook.xlsx.writeBuffer();
+      const outBlob = await put(`output/${path.basename(outputExcel)}`, buffer, {
+        access: 'public',
+        addRandomSuffix: true,
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        token: process.env.BLOB_READ_WRITE_TOKEN,
+      });
+      downloadUrl = outBlob.url;
+    } else {
+      await saveWorkbook(workbook, outputExcel);
+      const token = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      localDownloads.set(token, outputExcel);
+      downloadUrl = `/download/${token}`;
+    }
+
+    emit({ type: 'done', stats, downloadUrl, message: `Done! ${written} records written. ${flagged} flagged for review.` });
     emit({ type: 'close', status: 'done', stats });
 
   } catch (err) {
-    job.status = 'error';
-    job.error  = err.message;
     emit({ type: 'error', message: err.message });
     emit({ type: 'close', status: 'error', error: err.message });
   } finally {
