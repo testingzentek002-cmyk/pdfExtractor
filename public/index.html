@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voter PDF → Excel Extractor</title>
+  <meta name="description" content="Extract voter records from Hindi electoral roll PDFs into Excel with zero data loss." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & Tokens ──────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --surface2:    #21262d;
+      --border:      #30363d;
+      --accent:      #3b82f6;
+      --accent-glow: rgba(59,130,246,0.35);
+      --accent2:     #8b5cf6;
+      --ok:          #22c55e;
+      --warn:        #f59e0b;
+      --danger:      #ef4444;
+      --text:        #e6edf3;
+      --muted:       #8b949e;
+      --radius:      14px;
+      --shadow:      0 8px 32px rgba(0,0,0,0.5);
+    }
+
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Background mesh ─────────────────────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0; z-index: -1;
+      background:
+        radial-gradient(ellipse 80% 60% at 20% 10%, rgba(59,130,246,0.12) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 50% at 80% 80%, rgba(139,92,246,0.10) 0%, transparent 60%);
+    }
+
+    /* ── Layout ──────────────────────────────────────────────────────────── */
+    .container { max-width: 860px; margin: 0 auto; padding: 48px 24px 80px; }
+
+    /* ── Header ──────────────────────────────────────────────────────────── */
+    .header { text-align: center; margin-bottom: 52px; }
+    .header-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: rgba(59,130,246,0.12);
+      border: 1px solid rgba(59,130,246,0.3);
+      border-radius: 100px;
+      padding: 6px 16px;
+      font-size: 12px; font-weight: 600; color: var(--accent);
+      letter-spacing: 0.08em; text-transform: uppercase;
+      margin-bottom: 20px;
+    }
+    .header-badge .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.4; transform: scale(0.85); }
+    }
+    h1 {
+      font-size: clamp(2rem, 5vw, 3rem);
+      font-weight: 800;
+      line-height: 1.1;
+      background: linear-gradient(135deg, #e6edf3 0%, #8b949e 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 14px;
+    }
+    h1 span {
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .subtitle {
+      font-size: 1.05rem;
+      color: var(--muted);
+      line-height: 1.6;
+      max-width: 520px;
+      margin: 0 auto;
+    }
+
+    /* ── Card ────────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      transition: border-color 0.25s;
+    }
+    .card:hover { border-color: rgba(59,130,246,0.35); }
+
+    /* ── Drop zone ───────────────────────────────────────────────────────── */
+    .drop-zone {
+      position: relative;
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 56px 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      background: rgba(255,255,255,0.01);
+      margin: 28px;
+    }
+    .drop-zone:hover,
+    .drop-zone.dragover {
+      border-color: var(--accent);
+      background: rgba(59,130,246,0.06);
+      box-shadow: 0 0 0 4px var(--accent-glow);
+    }
+    .drop-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+
+    .drop-icon {
+      width: 72px; height: 72px; margin: 0 auto 20px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(139,92,246,0.2));
+      border: 1px solid rgba(59,130,246,0.3);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 32px;
+      transition: transform 0.25s;
+    }
+    .drop-zone:hover .drop-icon { transform: translateY(-4px) scale(1.05); }
+
+    .drop-title { font-size: 1.15rem; font-weight: 600; margin-bottom: 8px; }
+    .drop-sub   { font-size: 0.88rem; color: var(--muted); }
+    .drop-sub em { color: var(--accent); font-style: normal; font-weight: 600; cursor: pointer; }
+
+    /* file chosen state */
+    .drop-zone.has-file { border-color: var(--ok); background: rgba(34,197,94,0.05); }
+    .drop-zone.has-file .drop-icon { background: linear-gradient(135deg, rgba(34,197,94,0.2), rgba(34,197,94,0.1)); border-color: rgba(34,197,94,0.4); }
+
+    /* ── Button ──────────────────────────────────────────────────────────── */
+    .btn-row { padding: 0 28px 28px; }
+    .btn {
+      width: 100%;
+      padding: 15px 24px;
+      font-family: inherit;
+      font-size: 1rem; font-weight: 700;
+      border: none; border-radius: 10px; cursor: pointer;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+      color: #fff;
+      letter-spacing: 0.02em;
+      transition: all 0.2s;
+      position: relative; overflow: hidden;
+    }
+    .btn::before {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.15), transparent);
+      opacity: 0; transition: opacity 0.2s;
+    }
+    .btn:hover:not(:disabled)::before { opacity: 1; }
+    .btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(59,130,246,0.4); }
+    .btn:active:not(:disabled) { transform: translateY(0); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    /* ── Checks panel ────────────────────────────────────────────────────── */
+    .panel { padding: 24px 28px; border-top: 1px solid var(--border); }
+    .panel-title {
+      font-size: 0.75rem; font-weight: 700; letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 14px;
+    }
+
+    .check-list { display: flex; flex-direction: column; gap: 8px; }
+    .check-item {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 0.88rem; color: var(--muted);
+      opacity: 0; transform: translateX(-10px);
+      transition: all 0.3s ease;
+    }
+    .check-item.visible { opacity: 1; transform: translateX(0); }
+    .check-icon { font-size: 1rem; width: 20px; text-align: center; flex-shrink: 0; }
+    .check-item.pass { color: var(--text); }
+    .check-item.fail { color: var(--danger); }
+
+    /* ── Progress ────────────────────────────────────────────────────────── */
+    .progress-section { display: none; }
+    .progress-section.visible { display: block; }
+
+    .progress-bar-wrap {
+      background: var(--surface2);
+      border-radius: 100px;
+      height: 10px;
+      overflow: hidden;
+      margin: 12px 0;
+    }
+    .progress-bar {
+      height: 100%;
+      border-radius: 100px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      width: 0%;
+      transition: width 0.5s ease;
+      position: relative;
+    }
+    .progress-bar::after {
+      content: '';
+      position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+      background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.3) 50%, transparent 100%);
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+
+    .progress-label {
+      display: flex; justify-content: space-between;
+      font-size: 0.82rem; color: var(--muted);
+    }
+    .progress-label strong { color: var(--text); }
+
+    /* ── Log stream ──────────────────────────────────────────────────────── */
+    .log-box {
+      background: #0a0e14;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      font-family: 'Consolas', 'Fira Mono', monospace;
+      font-size: 0.8rem;
+      line-height: 1.7;
+      max-height: 220px;
+      overflow-y: auto;
+      margin-top: 16px;
+      color: #7dd3fc;
+    }
+    .log-box .log-line { opacity: 0; animation: fadeIn 0.3s forwards; }
+    .log-box .log-ok   { color: #86efac; }
+    .log-box .log-warn { color: #fde68a; }
+    .log-box .log-err  { color: #fca5a5; }
+    .log-box .log-info { color: #7dd3fc; }
+    @keyframes fadeIn { to { opacity: 1; } }
+
+    /* ── Stats grid ──────────────────────────────────────────────────────── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .stat-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+      opacity: 0; transform: translateY(8px);
+      transition: all 0.4s ease;
+    }
+    .stat-card.visible { opacity: 1; transform: translateY(0); }
+    .stat-value { font-size: 1.8rem; font-weight: 800; line-height: 1; }
+    .stat-label { font-size: 0.73rem; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .stat-ok     .stat-value { color: var(--ok); }
+    .stat-warn   .stat-value { color: var(--warn); }
+    .stat-danger .stat-value { color: var(--danger); }
+    .stat-blue   .stat-value { color: var(--accent); }
+
+    /* ── Download button ─────────────────────────────────────────────────── */
+    .download-btn {
+      display: none;
+      width: 100%;
+      padding: 15px 24px;
+      font-family: inherit;
+      font-size: 1rem; font-weight: 700;
+      border: none; border-radius: 10px; cursor: pointer;
+      background: linear-gradient(135deg, var(--ok) 0%, #16a34a 100%);
+      color: #fff;
+      letter-spacing: 0.02em;
+      margin-top: 20px;
+      transition: all 0.2s;
+    }
+    .download-btn.visible { display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .download-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(34,197,94,0.4); }
+
+    /* ── Reconciliation badge ─────────────────────────────────────────────── */
+    .recon-badge {
+      display: none;
+      align-items: center; gap: 10px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 0.88rem; font-weight: 600;
+      margin-top: 16px;
+    }
+    .recon-badge.ok   { background: rgba(34,197,94,0.1);  border: 1px solid rgba(34,197,94,0.3);  color: var(--ok);    display: flex; }
+    .recon-badge.warn { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.3);  color: var(--danger); display: flex; }
+
+    /* ── Features strip ──────────────────────────────────────────────────── */
+    .features {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      justify-content: center;
+      margin-top: 40px;
+    }
+    .feature-pill {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 8px 16px;
+      font-size: 0.8rem; color: var(--muted);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .feature-pill span { font-size: 0.9em; }
+
+    /* ── Reset link ──────────────────────────────────────────────────────── */
+    .reset-link {
+      display: none;
+      margin-top: 12px;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--muted);
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .reset-link:hover { color: var(--text); }
+    .reset-link.visible { display: block; }
+
+    /* ── Scrollbar ───────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 100px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-badge">
+      <span class="dot"></span>
+      Electoral Data Processing
+    </div>
+    <h1>Voter PDF<br /><span>→ Excel Extractor</span></h1>
+    <p class="subtitle">
+      Extract every voter record from Hindi electoral roll PDFs into a clean,
+      auditable Excel file — with zero data loss.
+    </p>
+  </div>
+
+  <!-- Upload card -->
+  <div class="card" id="uploadCard">
+
+    <!-- Drop zone -->
+    <div class="drop-zone" id="dropZone">
+      <input type="file" id="fileInput" accept=".pdf" />
+      <div class="drop-icon" id="dropIcon">📄</div>
+      <div class="drop-title" id="dropTitle">Drop your voter-list PDF here</div>
+      <div class="drop-sub" id="dropSub">or <em onclick="document.getElementById('fileInput').click()">browse to upload</em> · PDF up to 100 MB</div>
+    </div>
+
+    <!-- Extract button -->
+    <div class="btn-row">
+      <button class="btn" id="extractBtn" disabled>
+        Extract Voter Records
+      </button>
+    </div>
+
+    <!-- Dependency checks -->
+    <div class="panel" id="checksPanel" style="display:none">
+      <div class="panel-title">Dependency Checks</div>
+      <div class="check-list" id="checkList"></div>
+    </div>
+
+    <!-- Progress section -->
+    <div class="panel progress-section" id="progressSection">
+      <div class="panel-title">Extraction Progress</div>
+
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="progress-label">
+        <span id="progressMsg">Starting…</span>
+        <strong id="progressPct">0%</strong>
+      </div>
+
+      <div class="log-box" id="logBox"></div>
+
+      <!-- Stats -->
+      <div class="stats-grid" id="statsGrid" style="display:none">
+        <div class="stat-card stat-blue" id="statBoxes">
+          <div class="stat-value" id="valBoxes">—</div>
+          <div class="stat-label">Boxes Found</div>
+        </div>
+        <div class="stat-card stat-ok" id="statWritten">
+          <div class="stat-value" id="valWritten">—</div>
+          <div class="stat-label">Rows Written</div>
+        </div>
+        <div class="stat-card stat-warn" id="statFlagged">
+          <div class="stat-value" id="valFlagged">—</div>
+          <div class="stat-label">Needs Review</div>
+        </div>
+        <div class="stat-card stat-danger" id="statPartial">
+          <div class="stat-value" id="valPartial">—</div>
+          <div class="stat-label">Partial</div>
+        </div>
+      </div>
+
+      <!-- Reconciliation badge -->
+      <div class="recon-badge" id="reconBadge"></div>
+
+      <!-- Download -->
+      <button class="download-btn" id="downloadBtn">
+        ⬇ Download Excel File
+      </button>
+
+      <div class="reset-link" id="resetLink" onclick="resetUI()">Process another PDF</div>
+    </div>
+
+  </div>
+
+  <!-- Feature pills -->
+  <div class="features">
+    <div class="feature-pill"><span>🔒</span> Zero data loss</div>
+    <div class="feature-pill"><span>🕵️</span> Per-box audit trail</div>
+    <div class="feature-pill"><span>🔁</span> Idempotent runs</div>
+    <div class="feature-pill"><span>🟡</span> Review flagging</div>
+    <div class="feature-pill"><span>📋</span> Raw text reference sheet</div>
+    <div class="feature-pill"><span>🤖</span> Claude API ready</div>
+  </div>
+
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let selectedFile = null;
+  let currentJobId = null;
+  let evtSource    = null;
+
+  // ── Elements ───────────────────────────────────────────────────────────────
+  const dropZone     = document.getElementById('dropZone');
+  const fileInput    = document.getElementById('fileInput');
+  const extractBtn   = document.getElementById('extractBtn');
+  const dropTitle    = document.getElementById('dropTitle');
+  const dropSub      = document.getElementById('dropSub');
+  const dropIcon     = document.getElementById('dropIcon');
+  const checksPanel  = document.getElementById('checksPanel');
+  const checkList    = document.getElementById('checkList');
+  const progressSection = document.getElementById('progressSection');
+  const progressBar  = document.getElementById('progressBar');
+  const progressMsg  = document.getElementById('progressMsg');
+  const progressPct  = document.getElementById('progressPct');
+  const logBox       = document.getElementById('logBox');
+  const statsGrid    = document.getElementById('statsGrid');
+  const downloadBtn  = document.getElementById('downloadBtn');
+  const reconBadge   = document.getElementById('reconBadge');
+  const resetLink    = document.getElementById('resetLink');
+
+  // ── Drag & drop ────────────────────────────────────────────────────────────
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file && file.name.endsWith('.pdf')) setFile(file);
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) setFile(fileInput.files[0]);
+  });
+
+  function setFile(file) {
+    selectedFile = file;
+    const sizeMB = (file.size / 1024 / 1024).toFixed(1);
+    dropTitle.textContent = file.name;
+    dropSub.innerHTML     = `${sizeMB} MB &nbsp;·&nbsp; Ready to extract`;
+    dropIcon.textContent  = '✅';
+    dropZone.classList.add('has-file');
+    extractBtn.disabled = false;
+  }
+
+  // ── Extract ────────────────────────────────────────────────────────────────
+  extractBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    extractBtn.disabled = true;
+
+    // Show panels
+    checksPanel.style.display = 'block';
+    progressSection.classList.add('visible');
+    checkList.innerHTML = '';
+    logBox.innerHTML    = '';
+    reconBadge.className = 'recon-badge';
+    statsGrid.style.display = 'none';
+    downloadBtn.classList.remove('visible');
+    resetLink.classList.remove('visible');
+
+    // Upload PDF
+    const form = new FormData();
+    form.append('pdf', selectedFile);
+
+    addLog('info', `Uploading ${selectedFile.name}…`);
+
+    let jobId;
+    try {
+      const res  = await fetch('/upload', { method: 'POST', body: form });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      jobId = data.jobId;
+      currentJobId = jobId;
+    } catch (err) {
+      addLog('err', `Upload failed: ${err.message}`);
+      return;
+    }
+
+    addLog('ok', `Upload complete. Job ID: ${jobId}`);
+
+    // Open SSE stream
+    evtSource = new EventSource(`/progress/${jobId}`);
+    evtSource.onmessage = e => handleEvent(JSON.parse(e.data), jobId);
+    evtSource.onerror   = () => { addLog('warn', 'SSE connection closed'); evtSource.close(); };
+  });
+
+  function handleEvent(msg, jobId) {
+    switch (msg.type) {
+      case 'start':
+        addLog('info', msg.message);
+        break;
+
+      case 'check':
+        addLog('info', msg.message);
+        break;
+
+      case 'check_item': {
+        const item = document.createElement('div');
+        item.className = `check-item ${msg.passed ? 'pass' : 'fail'}`;
+        item.innerHTML = `<span class="check-icon">${msg.passed ? '✅' : '❌'}</span>
+          <span>${msg.label}${msg.note ? ' <span style="color:var(--muted);font-size:0.8em">('+msg.note+')</span>' : ''}</span>`;
+        checkList.appendChild(item);
+        requestAnimationFrame(() => item.classList.add('visible'));
+        break;
+      }
+
+      case 'info':
+        addLog('info', msg.message);
+        break;
+
+      case 'warn':
+        addLog('warn', msg.message);
+        break;
+
+      case 'page':
+        progressMsg.textContent = msg.message;
+        addLog('info', msg.message);
+        break;
+
+      case 'boxes':
+        addLog('ok', `  ↳ ${msg.message}`);
+        break;
+
+      case 'progress': {
+        const pct = msg.percent;
+        progressBar.style.width = `${pct}%`;
+        progressPct.textContent = `${pct}%`;
+        progressMsg.textContent = `Page ${msg.pageNum} / ${msg.numPages} — ${msg.written} records extracted`;
+        break;
+      }
+
+      case 'done':
+        addLog('ok', `✔ ${msg.message}`);
+        showStats(msg.stats, jobId);
+        break;
+
+      case 'error':
+        addLog('err', `✖ ${msg.message}`);
+        extractBtn.disabled = false;
+        resetLink.classList.add('visible');
+        break;
+
+      case 'close':
+        evtSource.close();
+        if (msg.status === 'done') {
+          progressBar.style.width = '100%';
+          progressPct.textContent = '100%';
+          resetLink.classList.add('visible');
+        }
+        break;
+    }
+  }
+
+  function addLog(level, text) {
+    const line = document.createElement('div');
+    line.className = `log-line log-${level}`;
+    const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
+    line.textContent = `[${ts}]  ${text}`;
+    logBox.appendChild(line);
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function showStats(stats, jobId) {
+    statsGrid.style.display  = 'grid';
+
+    document.getElementById('valBoxes').textContent   = stats.totalBoxes;
+    document.getElementById('valWritten').textContent = stats.written;
+    document.getElementById('valFlagged').textContent = stats.flagged;
+    document.getElementById('valPartial').textContent = stats.partial;
+
+    // Animate in stat cards
+    document.querySelectorAll('.stat-card').forEach((card, i) => {
+      setTimeout(() => card.classList.add('visible'), i * 80);
+    });
+
+    // Reconciliation check
+    if (stats.totalBoxes === stats.written) {
+      reconBadge.className     = 'recon-badge ok';
+      reconBadge.innerHTML     = `✅ <span>Reconciliation OK — ${stats.totalBoxes} boxes = ${stats.written} rows written</span>`;
+    } else {
+      reconBadge.className     = 'recon-badge warn';
+      reconBadge.innerHTML     = `⚠️ <span>Count mismatch — ${stats.totalBoxes} boxes detected but only ${stats.written} rows written. Check the audit log.</span>`;
+    }
+
+    // Download button
+    downloadBtn.classList.add('visible');
+    downloadBtn.onclick = () => window.location.href = `/download/${jobId}`;
+  }
+
+  function resetUI() {
+    selectedFile = null;
+    currentJobId = null;
+    if (evtSource) { evtSource.close(); evtSource = null; }
+
+    fileInput.value   = '';
+    dropTitle.textContent = 'Drop your voter-list PDF here';
+    dropSub.innerHTML = 'or <em onclick="document.getElementById(\'fileInput\').click()">browse to upload</em> · PDF up to 100 MB';
+    dropIcon.textContent = '📄';
+    dropZone.classList.remove('has-file', 'dragover');
+
+    extractBtn.disabled = true;
+    checksPanel.style.display = 'none';
+    progressSection.classList.remove('visible');
+    checkList.innerHTML = '';
+    logBox.innerHTML    = '';
+    progressBar.style.width = '0%';
+    progressPct.textContent = '0%';
+    progressMsg.textContent = '';
+    statsGrid.style.display = 'none';
+    reconBadge.className = 'recon-badge';
+    downloadBtn.classList.remove('visible');
+    resetLink.classList.remove('visible');
+
+    document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('visible'));
+  }
+</script>
+</body>
+</html>

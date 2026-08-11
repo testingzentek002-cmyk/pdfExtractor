@@ -1,0 +1,31 @@
+{
+  "name": "voter-detail-extractor",
+  "version": "1.0.0",
+  "description": "Extracts voter records from Hindi PDF electoral rolls and writes to Excel with zero data loss.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "cli": "node src/index.js",
+    "extract": "node src/index.js"
+  },
+  "keywords": [
+    "voter",
+    "pdf",
+    "excel",
+    "extraction",
+    "hindi",
+    "electoral"
+  ],
+  "author": "Ravindra Singh",
+  "license": "MIT",
+  "dependencies": {
+    "canvas": "^2.11.2",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "multer": "^2.2.0",
+    "pdfjs-dist": "^4.4.168"
+  }
+}

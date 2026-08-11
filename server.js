@@ -1,0 +1,279 @@
+/**
+ * server.js
+ * Local Express web server for the Voter PDF → Excel Extraction Agent.
+ *
+ * Endpoints:
+ *   GET  /              → Serve the web UI
+ *   POST /upload        → Accept PDF upload, start extraction, stream progress via SSE
+ *   GET  /progress/:id  → SSE stream for real-time progress updates
+ *   GET  /download/:id  → Download generated Excel file
+ *   GET  /status/:id    → JSON status of a run
+ */
+
+'use strict';
+
+require('dotenv').config();
+
+const express  = require('express');
+const multer   = require('multer');
+const path     = require('path');
+const fs       = require('fs');
+const { EventEmitter } = require('events');
+
+// ─── Patch logger to emit events for the web UI ──────────────────────────────
+// We override the singleton logger to broadcast via SSE
+const baseLogger = require('./src/logger');
+
+// Global job registry
+const jobs = new Map(); // jobId → { status, progress, outputPath, error, emitter, stats }
+
+// ─── Multer config — store uploads in /uploads ────────────────────────────────
+const uploadsDir = path.join(__dirname, 'uploads');
+const outputDir  = path.join(__dirname, 'output');
+[uploadsDir, outputDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename:    (req, file, cb) => {
+    const ts   = Date.now();
+    const safe = file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+    cb(null, `${ts}_${safe}`);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB max
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/pdf' || file.originalname.endsWith('.pdf')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are accepted'));
+    }
+  },
+});
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── POST /upload ─────────────────────────────────────────────────────────────
+app.post('/upload', upload.single('pdf'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No PDF file provided' });
+  }
+
+  const jobId      = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const inputPdf   = req.file.path;
+  const pdfBase    = path.basename(req.file.originalname, '.pdf').replace(/[^a-zA-Z0-9\-_]/g, '_');
+  const outputExcel = path.join(outputDir, `${pdfBase}_${Date.now()}_extracted.xlsx`);
+  const useClaude  = process.env.USE_CLAUDE === 'true';
+
+  const emitter = new EventEmitter();
+  jobs.set(jobId, {
+    status: 'queued',
+    progress: [],
+    outputPath: outputExcel,
+    inputName: req.file.originalname,
+    error: null,
+    emitter,
+    stats: null,
+  });
+
+  res.json({ jobId });
+
+  // Run extraction asynchronously
+  setImmediate(() => runExtractionJob(jobId, inputPdf, outputExcel, useClaude));
+});
+
+// ─── GET /progress/:id  (Server-Sent Events) ──────────────────────────────────
+app.get('/progress/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  // Replay buffered messages
+  job.progress.forEach(msg => send(msg));
+
+  // If already done, close immediately
+  if (job.status === 'done' || job.status === 'error') {
+    send({ type: 'close', status: job.status, stats: job.stats, error: job.error });
+    return res.end();
+  }
+
+  // Live messages
+  job.emitter.on('message', (msg) => {
+    send(msg);
+    if (msg.type === 'close') res.end();
+  });
+
+  req.on('close', () => job.emitter.removeAllListeners('message'));
+});
+
+// ─── GET /download/:id ────────────────────────────────────────────────────────
+app.get('/download/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'done') return res.status(400).json({ error: 'Job not complete yet' });
+  if (!fs.existsSync(job.outputPath)) return res.status(404).json({ error: 'Output file not found' });
+
+  const filename = path.basename(job.outputPath);
+  res.download(job.outputPath, filename);
+});
+
+// ─── GET /status/:id ─────────────────────────────────────────────────────────
+app.get('/status/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({ status: job.status, stats: job.stats, error: job.error, inputName: job.inputName });
+});
+
+// ─── Extraction runner ────────────────────────────────────────────────────────
+
+async function runExtractionJob(jobId, inputPdf, outputExcel, useClaude) {
+  const job = jobs.get(jobId);
+
+  function emit(msg) {
+    job.progress.push(msg);
+    job.emitter.emit('message', msg);
+  }
+
+  try {
+    job.status = 'running';
+    emit({ type: 'start', message: `Starting extraction…`, inputName: job.inputName });
+
+    // ── Dependency validation ─────────────────────────────────────────────
+    emit({ type: 'check', message: 'Running dependency checks…' });
+
+    const { validateDependencies } = require('./src/validator');
+    // Temporarily redirect logger checkResult to SSE
+    const origCheck = baseLogger.checkResult.bind(baseLogger);
+    baseLogger.checkResult = (label, passed, note) => {
+      emit({ type: 'check_item', label, passed, note: note || '' });
+      origCheck(label, passed, note);
+    };
+
+    await validateDependencies({ inputPdf, outputExcel, useClaude });
+    baseLogger.checkResult = origCheck;
+
+    // ── PDF loading ───────────────────────────────────────────────────────
+    const { loadPdf, readPdfPage, detectBoxes } = require('./src/pdfReader');
+    const pdfDoc   = await loadPdf(inputPdf);
+    const numPages = pdfDoc.numPages;
+    emit({ type: 'info', message: `PDF loaded: ${numPages} page(s)` });
+
+    // ── Excel setup ───────────────────────────────────────────────────────
+    const { createTemplate, writeRow, writeRawRow, saveWorkbook } = require('./src/excelWriter');
+    const { workbook, mainSheet, rawSheet } = createTemplate();
+
+    // ── Extractor ─────────────────────────────────────────────────────────
+    const extractor = useClaude ? require('./src/claudeExtractor') : require('./src/parser');
+    const { validateBatchResult, classifyRecord } = require('./src/validator');
+    const { batchArray, dedupKey } = require('./src/utils');
+    const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '9', 10);
+
+    const seen = new Map();
+    let excelRow = 2, totalBoxes = 0, written = 0, flagged = 0, partial = 0;
+
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      emit({ type: 'page', message: `Processing page ${pageNum} of ${numPages}…`, pageNum, numPages });
+
+      let textItems;
+      try { textItems = await readPdfPage(pdfDoc, pageNum); }
+      catch (err) { emit({ type: 'warn', message: `Page ${pageNum} read error: ${err.message}` }); continue; }
+
+      const boxes = detectBoxes(textItems, pageNum);
+      totalBoxes += boxes.length;
+      emit({ type: 'boxes', message: `Page ${pageNum}: ${boxes.length} box(es) detected`, count: boxes.length });
+
+      const batches = batchArray(boxes, BATCH_SIZE);
+
+      for (let bi = 0; bi < batches.length; bi++) {
+        const batch = batches[bi];
+        let records;
+        try {
+          records = await extractor.extractBatch(batch);
+        } catch (err) {
+          records = batch.map(box => needsReviewStub(box));
+        }
+
+        const { valid } = validateBatchResult(records, batch.length);
+        if (!valid) {
+          try { records = await extractor.extractBatch(batch); }
+          catch (_) { records = batch.map(box => needsReviewStub(box)); }
+        }
+
+        for (let i = 0; i < records.length; i++) {
+          const rec    = records[i];
+          const srcBox = batch[i];
+          rec.pageNo  = rec.pageNo  ?? srcBox.pageNo;
+          rec.boxNo   = rec.boxNo   ?? srcBox.boxNo;
+          rec.rawText = rec.rawText ?? srcBox.rawText;
+
+          const status = classifyRecord(rec);
+          const key    = dedupKey(rec.voterId, rec.pageNo, rec.boxNo);
+          if (seen.has(key)) continue;
+          seen.set(key, excelRow);
+
+          writeRow(mainSheet, rec, excelRow, status);
+          writeRawRow(rawSheet, rec, excelRow);
+
+          if (status === 'NEEDS_REVIEW') flagged++;
+          else if (status === 'PARTIAL') partial++;
+          written++;
+          excelRow++;
+        }
+      }
+
+      // Per-page progress update
+      emit({
+        type:       'progress',
+        pageNum,
+        numPages,
+        totalBoxes,
+        written,
+        flagged,
+        partial,
+        percent:    Math.round((pageNum / numPages) * 100),
+      });
+    }
+
+    await saveWorkbook(workbook, outputExcel);
+
+    const stats = { totalBoxes, written, flagged, partial };
+    job.status  = 'done';
+    job.stats   = stats;
+
+    emit({ type: 'done', stats, message: `Done! ${written} records written. ${flagged} flagged for review.` });
+    emit({ type: 'close', status: 'done', stats });
+
+  } catch (err) {
+    job.status = 'error';
+    job.error  = err.message;
+    emit({ type: 'error', message: err.message });
+    emit({ type: 'close', status: 'error', error: err.message });
+  }
+}
+
+function needsReviewStub(box) {
+  return { serialNo: null, voterId: null, name: null, relationType: null,
+    relationName: null, houseNo: null, age: null, gender: null,
+    confidence: 'low', pageNo: box.pageNo, boxNo: box.boxNo, rawText: box.rawText };
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log('\n╔══════════════════════════════════════════════════════════╗');
+  console.log('║      Voter PDF → Excel Extraction Agent  v1.0           ║');
+  console.log('║                   Web Server                             ║');
+  console.log('╚══════════════════════════════════════════════════════════╝');
+  console.log(`\n  🌐  Open in browser: http://localhost:${PORT}\n`);
+});
